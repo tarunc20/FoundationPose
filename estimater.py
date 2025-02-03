@@ -151,7 +151,7 @@ class FoundationPose:
 
     if self.debug>=2:
       pcd = toOpen3dCloud(center.reshape(1,3))
-      o3d.io.write_point_cloud(f'{self.debug_dir}/init_center.ply', pcd)
+      #o3d.io.write_point_cloud(f'{self.debug_dir}/init_center.ply', pcd)
 
     return center.reshape(3)
 
@@ -177,8 +177,8 @@ class FoundationPose:
       xyz_map = depth2xyzmap(depth, K)
       valid = xyz_map[...,2]>=0.001
       pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
-      o3d.io.write_point_cloud(f'{self.debug_dir}/scene_raw.ply',pcd)
-      cv2.imwrite(f'{self.debug_dir}/ob_mask.png', (ob_mask*255.0).clip(0,255))
+      #o3d.io.write_point_cloud(f'{self.debug_dir}/scene_raw.ply',pcd)
+      #cv2.imwrite(f'{self.debug_dir}/ob_mask.png', (ob_mask*255.0).clip(0,255))
 
     normal_map = None
     valid = (depth>=0.001) & (ob_mask>0)
@@ -189,11 +189,11 @@ class FoundationPose:
       return pose
 
     if self.debug>=2:
-      imageio.imwrite(f'{self.debug_dir}/color.png', rgb)
-      cv2.imwrite(f'{self.debug_dir}/depth.png', (depth*1000).astype(np.uint16))
+      #imageio.imwrite(f'{self.debug_dir}/color.png', rgb)
+      #cv2.imwrite(f'{self.debug_dir}/depth.png', (depth*1000).astype(np.uint16))
       valid = xyz_map[...,2]>=0.001
       pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
-      o3d.io.write_point_cloud(f'{self.debug_dir}/scene_complete.ply',pcd)
+      #o3d.io.write_point_cloud(f'{self.debug_dir}/scene_complete.ply',pcd)
 
     self.H, self.W = depth.shape[:2]
     self.K = K
@@ -213,12 +213,12 @@ class FoundationPose:
 
     xyz_map = depth2xyzmap(depth, K)
     poses, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, xyz_map=xyz_map, glctx=self.glctx, mesh_diameter=self.diameter, iteration=iteration, get_vis=self.debug>=2)
-    if vis is not None:
-      imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
+    # if vis is not None:
+    #   imageio.imwrite(f'{self.debug_dir}/vis_refiner.png', vis)
 
     scores, vis = self.scorer.predict(mesh=self.mesh, rgb=rgb, depth=depth, K=K, ob_in_cams=poses.data.cpu().numpy(), normal_map=normal_map, mesh_tensors=self.mesh_tensors, glctx=self.glctx, mesh_diameter=self.diameter, get_vis=self.debug>=2)
-    if vis is not None:
-      imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
+    # if vis is not None:
+    #   imageio.imwrite(f'{self.debug_dir}/vis_score.png', vis)
 
     add_errs = self.compute_add_err_to_gt_pose(poses)
     logging.info(f"final, add_errs min:{add_errs.min()}")
@@ -247,7 +247,7 @@ class FoundationPose:
     return -torch.ones(len(poses), device='cuda', dtype=torch.float)
 
 
-  def track_one(self, rgb, depth, K, iteration, extra={}):
+  def track_one(self, rgb, depth, K, iteration, extra={}, ob_mask=None):
     if self.pose_last is None:
       logging.info("Please init pose by register first")
       raise RuntimeError
@@ -259,8 +259,12 @@ class FoundationPose:
     logging.info("depth processing done")
 
     xyz_map = depth2xyzmap_batch(depth[None], torch.as_tensor(K, dtype=torch.float, device='cuda')[None], zfar=np.inf)[0]
-
-    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=self.pose_last.reshape(1,4,4).data.cpu().numpy(), normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
+    # re-estimate translation 
+    ob_in_cams = self.pose_last.reshape(1,4,4).data.cpu().numpy()
+    if ob_mask is not None and ob_mask.sum() > 500:
+      center = self.guess_translation(depth=depth.data.cpu().numpy(), mask=ob_mask, K=K)
+      ob_in_cams[:, :3, 3] = center
+    pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=ob_in_cams, normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
     logging.info("pose done")
     if self.debug>=2:
       extra['vis'] = vis

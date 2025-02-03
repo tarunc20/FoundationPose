@@ -91,10 +91,11 @@ COLOR_MAP=np.array([[0, 0, 0], #Ignore
                     ])
 
 
-def set_logging_format(level=logging.INFO):
+def set_logging_format(level=logging.CRITICAL):
   importlib.reload(logging)
   FORMAT = '[%(funcName)s()] %(message)s'
   logging.basicConfig(level=level, format=FORMAT)
+  logging.disabled = True 
 
 set_logging_format()
 
@@ -722,10 +723,16 @@ def draw_posed_3d_box(K, img, ob_in_cam, bbox, line_color=(0,255,0), linewidth=2
 
   def draw_line3d(start,end,img):
     pts = np.stack((start,end),axis=0).reshape(-1,3)
+    assert pts.shape == (2, 3)
     pts = (ob_in_cam@to_homo(pts).T).T[:,:3]   #(2,3)
+    assert pts.shape == (2, 3) 
     projected = (K@pts.T).T
-    uv = np.round(projected[:,:2]/projected[:,2].reshape(-1,1)).astype(int)   #(2,2)
-    img = cv2.line(img, uv[0].tolist(), uv[1].tolist(), color=line_color, thickness=linewidth, lineType=cv2.LINE_AA)
+    assert projected.shape == (2, 3)
+    uv = np.round(projected[:,:2]/projected[:,2].reshape(-1,1)).astype(int).reshape(2, 2)   #(2,2)
+    assert uv.shape == (2, 2)
+    x = uv[0].tolist() #[uv[0,0].item(), uv[1,0].item()]
+    y = uv[1].tolist() #[uv[0, 1].item(), uv[1, 1].item()]
+    img = cv2.line(img, x, y, color=line_color, thickness=linewidth, lineType=cv2.LINE_AA)
     return img
 
   for y in [ymin,ymax]:
