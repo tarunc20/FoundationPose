@@ -75,7 +75,45 @@ def project_points_to_image(camera_intrinsics, camera_extrinsics, points_3d):
 
 #NUM_CAMS = 2
 
-CAMERA_IDXS = [1, 5, 7]
+CAMERA_IDXS = [0, 1, 3, 4, 6, 7]
+def construct_dataset(center_poses, yaml_file_path, args):
+  yaml_file = open(yaml_file_path)
+  yaml_data = yaml.safe_load(yaml_file)
+  serials = [yaml_data[i]['serial_number'] for i in range(len(yaml_data))]
+  all_camera_intrinsics = np.array([np.array(yaml_data[i]['color_intrinsic_matrix']) for i in range(8)])
+  all_camera_extrinsics = np.array([yaml_data[i]['transformation'] for i in range(8)])
+  if args.partial_dataset is None:
+    dataset = {
+      "video_name": args.test_scene_dir.split('/')[-1],
+      "object_names": {
+        "target_object": None,
+        "tool_object": None,
+      },
+      "camera_seq": serials,
+      "camera_intrinsics": all_camera_intrinsics,
+      "camera_extrinsics": all_camera_extrinsics, 
+      "target_object_pose": [], 
+      "tool_object_pose": [],  
+      "start_frame": 0,
+      "end_frame": NUM_FRAMES,    
+    } 
+  else:
+    with open(args.test_scene_dir, "rb") as f:
+      dataset = pickle.load(f)
+  if args.t == "tool":
+    dataset["object_names"]["tool_object"] = args.mesh_file.split('/')[-1]
+    idx = CAMERA_IDXS[0]
+    tool_object_pose = np.einsum('njk,ij->nik', np.array(center_poses[idx]), all_camera_extrinsics[idx])
+    dataset["tool_object_pose"] = tool_object_pose.copy()
+  if args.t == "target":
+    dataset["object_names"]["target_object"] = args.mesh_file.split('/')[-1]
+    idx = CAMERA_IDXS[0]
+    target_object_pose = np.einsum('njk,ij->nik', np.array(center_poses[idx]), all_camera_extrinsics[idx])
+    dataset["target_object_pose"] = target_object_pose.copy()
+  if args.partial_dataset is None:
+    pickle.dump(dataset, open(f"{args.test_scene_dir}/dataset_obj_{args.test_scene_dir.split('/')[-1]}.pkl", "wb"))
+
+
 def optimize_poses(poses, cam_extrinsics, to_origin):
   """
   poses: list of poses predicted by each FoundationPose estimator
@@ -139,7 +177,7 @@ def optimize_poses_pcd(poses, object_mesh, object_pcds, to_origin, all_camera_ex
   #return all_camera_extrinsics[np.argmin(dists)] @ poses[np.argmin(dists)]
   return optimize_poses([poses[i] for i in good_idxs], [all_camera_extrinsics[i] for i in good_idxs], to_origin)
 
-NUM_FRAMES = 10
+NUM_FRAMES = 400
 if __name__=='__main__':
   parser = argparse.ArgumentParser()
   code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -155,12 +193,13 @@ if __name__=='__main__':
   parser.add_argument('--t', type=str)
   parser.add_argument('--use_ransac', action="store_true")
   parser.add_argument('--use_pcd', action="store_true")
+  parser.add_argument('--partial_dataset', type=str, default=None)
   args = parser.parse_args()
   set_logging_format()
   set_seed(0)
 
   init_points = []
-  sam_pts = h5py.File(f"{args.test_scene_dir}/sam2_pcds_{args.t}_updated.h5", "r")
+  sam_pts = h5py.File(f"{args.test_scene_dir}/sam2_pcds_{args.t}.h5", "r")
   for i in range(len(sam_pts['cam_0'].keys())):
       init_pts = [np.array(sam_pts[f'cam_{cam}'][f'pcd_{i}']) * 1e-3 for cam in range(8)]
       init_points.append(init_pts)
@@ -206,8 +245,9 @@ if __name__=='__main__':
   #   estimaters.append(est)
   logging.info("estimator initialization done")
   data = h5py.File(args.robotool_datafile, "r")
-  yaml_file = open("/viscam/projects/robotool/videos_0121/camera_ext_calibration_0121.yaml")
+  yaml_file = open("/svl/u/tarunc/camera_ext_calibration_0121.yaml")
   yaml_data = yaml.safe_load(yaml_file)
+  serials = [yaml_data[i]['serial_number'] for i in range(len(yaml_data))]
   #all_camera_intrinsics = [np.array(yaml_data[i]['color_intrinsic_matrix']) for i in range(NUM_CAMS)]
   all_camera_intrinsics = {
     i: np.array(yaml_data[i]['color_intrinsic_matrix'])
@@ -225,16 +265,10 @@ if __name__=='__main__':
   imgs = {i: [] for i in CAMERA_IDXS}
   all_poses = {i: [] for i in CAMERA_IDXS}
   all_center_poses = {i: [] for i in CAMERA_IDXS}
-  #imgs = [[] for _ in range(NUM_CAMS)]
-  #all_poses = [[] for _ in range(NUM_CAMS)]
-  #all_center_poses = [[] for _ in range(NUM_CAMS)]
   sam_masks = None 
-  if os.path.exists(f"{args.test_scene_dir}/sam2_masks_{args.t}_updated.h5"):
-    sam_masks = h5py.File(f"{args.test_scene_dir}/sam2_masks_{args.t}_updated.h5", "r")
-  for i in tqdm(range(NUM_FRAMES)):#len(data['imgs'])):#reader.color_files)):
-    #logging.info(f'i:{i}')
-    #color1 = reader.get_color(i)
-    #depth1 = reader.get_depth(i)
+  if os.path.exists(f"{args.test_scene_dir}/sam2_masks_{args.t}.h5"):
+    sam_masks = h5py.File(f"{args.test_scene_dir}/sam2_masks_{args.t}.h5", "r")
+  for i in tqdm(range(NUM_FRAMES)):
     all_colors = {cam: None}
     all_depths = {cam: None}
     register_now = True
@@ -244,8 +278,6 @@ if __name__=='__main__':
       depth = data['depths'][i, cam, :, :].astype(np.float64)
       depth /= 1e3
       depth = cv2.resize(depth, (640,480), interpolation=cv2.INTER_NEAREST)
-      # if register_now:
-      #   color[0, 0] = np.array([[255, 255, 255]])
       depth[(depth<0.001) | (depth>=np.inf)] = 0
       all_colors[cam] = color
       all_depths[cam] = depth
@@ -261,10 +293,7 @@ if __name__=='__main__':
         if prev_poses[cam].shape == (1, 4, 4):
           prev_poses[cam] = prev_poses[cam][0]
         prev_dists.append(matrix_distance(all_est_poses[cam], (prev_poses[cam] @ estimaters[cam].get_tf_to_centered_mesh().cpu().numpy())))
-      # if min(prev_dists) > 0.3:
-      #   register_now = True 
-      #   registration_idxs.append(i)
-      #   print(f"DISTS: {prev_dists}")
+
     if i==0 or register_now:
       prev_poses = {cam: None for cam in CAMERA_IDXS}
       all_est_poses = {cam: None for cam in CAMERA_IDXS}
@@ -320,35 +349,24 @@ if __name__=='__main__':
               estimaters[cam].pose_last = estimaters[cam].pose_last[0]
 
     os.makedirs(f'{debug_dir}/ob_in_cam', exist_ok=True)
-    #np.savetxt(f'{debug_dir}/ob_in_cam/{reader.id_strs[i]}.txt', pose.reshape(4,4))
     for cam in CAMERA_IDXS:
       if debug>=1:
-        #assert all_est_poses[cam].shape == (4, 4), f"shape: {all_est_poses[cam].shape}"
         if all_est_poses[cam].shape == (1, 4, 4):
           all_est_poses[cam] = all_est_poses[cam][0]
         center_pose = all_est_poses[cam] @ np.linalg.inv(to_origin)
         assert center_pose.shape == (4, 4), f"center pose shape: {center_pose.shape, all_est_poses[cam].shape}"
-        # mesh_copy.apply_transform(center_pose)
-        # points_2d = project_points_to_image(all_camera_intrinsics[cam], np.eye(4), mesh_copy.vertices).astype(np.uint8) #+ np.array([[240, 320]])
-        # points_2d = points_2d[(points_2d[:, 0] > 0) & (points_2d[:, 0] < 480) & (points_2d[:, 1] > 0) & (points_2d[:, 1] < 640)]
         vis = draw_posed_3d_box(all_camera_intrinsics[cam], img=all_colors[cam], ob_in_cam=center_pose, bbox=bbox)
         vis = draw_xyz_axis(all_colors[cam], ob_in_cam=center_pose, scale=0.1, K=all_camera_intrinsics[cam], thickness=3, transparency=0, is_input_rgb=True)
-        #vis[points_2d[:, 0], points_2d[:, 1]] = np.array([[0, 0, 255]])
-        #cv2.imshow('1', vis[...,::-1])
-        #cv2.waitKey(1)
         mesh.apply_transform(np.linalg.inv(all_est_poses[cam]))
 
-      if debug>=2:
+      if debug>=3:
         os.makedirs(f'{debug_dir}/track_vis', exist_ok=True)
         imageio.imwrite(f'{debug_dir}/track_vis/img_{i}.png', vis[:, :, ::-1])
       imgs[cam].append(vis)
       all_poses[cam].append(pose)
       all_center_poses[cam].append(center_pose)
-      #print(f"pose: {pose}, center_pose: {center_pose}")
-  all_poses = np.array(all_poses)
-  all_center_poses = np.array(all_center_poses)
   os.makedirs(f"{args.test_scene_dir}/fp_{args.t}", exist_ok=True)
-  breakpoint()
+  construct_dataset(all_center_poses, "/svl/u/tarunc/camera_ext_calibration_0121.yaml", args)
   for cam in CAMERA_IDXS:
     np.save(f"{args.test_scene_dir}/fp_{args.t}/scene_poses_{cam}_{args.t}_{args.use_ransac}_avg_{args.use_pcd}_tex.npy", all_poses[cam])
     np.save(f"{args.test_scene_dir}/fp_{args.t}/scene_center_poses_{cam}_{args.t}_{args.use_ransac}_avg_{args.use_pcd}_tex.npy", all_center_poses[cam])
