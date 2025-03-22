@@ -1,0 +1,12 @@
+foundation_pose:
+  est_refine_iter: 10
+  track_refine_iter: 2
+  register: false
+  use_ransac: true 
+  use_pcd: true 
+  decim_verts_num: 200000
+  pcd_filter_thresh: 0.1
+  camera_idxs: [0, 1, 3, 4, 5, 6, 7]
+  start_frame: 65 
+  num_frames: 335 
+  debug: 2

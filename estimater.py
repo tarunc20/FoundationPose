@@ -65,9 +65,9 @@ class FoundationPose:
     logging.info(f'self.pts:{self.pts.shape}')
     self.mesh_path = None
     self.mesh = mesh
-    if self.mesh is not None:
-      self.mesh_path = f'/tmp/{uuid.uuid4()}.obj'
-      self.mesh.export(self.mesh_path)
+    # if self.mesh is not None:
+    #   self.mesh_path = f'/tmp/{uuid.uuid4()}.obj'
+    #   self.mesh.export(self.mesh_path)
     self.mesh_tensors = make_mesh_tensors(self.mesh)
 
     if symmetry_tfs is None:
@@ -156,7 +156,7 @@ class FoundationPose:
     return center.reshape(3)
 
 
-  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5):
+  def register(self, K, rgb, depth, ob_mask, ob_id=None, glctx=None, iteration=5, icp_pose=None):
     '''Copmute pose from given pts to self.pcd
     @pts: (N,3) np array, downsampled scene points
     '''
@@ -188,25 +188,25 @@ class FoundationPose:
       pose[:3,3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
       return pose
 
-    if self.debug>=2:
-      #imageio.imwrite(f'{self.debug_dir}/color.png', rgb)
-      #cv2.imwrite(f'{self.debug_dir}/depth.png', (depth*1000).astype(np.uint16))
-      valid = xyz_map[...,2]>=0.001
-      pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
-      #o3d.io.write_point_cloud(f'{self.debug_dir}/scene_complete.ply',pcd)
+    # if self.debug>=2:
+    #   #imageio.imwrite(f'{self.debug_dir}/color.png', rgb)
+    #   #cv2.imwrite(f'{self.debug_dir}/depth.png', (depth*1000).astype(np.uint16))
+    #   valid = xyz_map[...,2]>=0.001
+    #   pcd = toOpen3dCloud(xyz_map[valid], rgb[valid])
+    #   #o3d.io.write_point_cloud(f'{self.debug_dir}/scene_complete.ply',pcd)
 
     self.H, self.W = depth.shape[:2]
     self.K = K
     self.ob_id = ob_id
     self.ob_mask = ob_mask
+    if icp_pose is None:
+      poses = self.generate_random_pose_hypo(K=K, rgb=rgb, depth=depth, mask=ob_mask, scene_pts=None)
+      poses = poses.data.cpu().numpy()
+      logging.info(f'poses:{poses.shape}')
+      center = self.guess_translation(depth=depth, mask=ob_mask, K=K)
 
-    poses = self.generate_random_pose_hypo(K=K, rgb=rgb, depth=depth, mask=ob_mask, scene_pts=None)
-    poses = poses.data.cpu().numpy()
-    logging.info(f'poses:{poses.shape}')
-    center = self.guess_translation(depth=depth, mask=ob_mask, K=K)
-
-    poses = torch.as_tensor(poses, device='cuda', dtype=torch.float)
-    poses[:,:3,3] = torch.as_tensor(center.reshape(1,3), device='cuda')
+      poses = torch.as_tensor(poses, device='cuda', dtype=torch.float)
+      poses[:,:3,3] = torch.as_tensor(center.reshape(1,3), device='cuda')
 
     add_errs = self.compute_add_err_to_gt_pose(poses)
     logging.info(f"after viewpoint, add_errs min:{add_errs.min()}")
@@ -247,7 +247,7 @@ class FoundationPose:
     return -torch.ones(len(poses), device='cuda', dtype=torch.float)
 
 
-  def track_one(self, rgb, depth, K, iteration, extra={}, ob_mask=None):
+  def track_one(self, rgb, depth, K, iteration, extra={}, ob_mask=None, alt_pose=None):
     if self.pose_last is None:
       logging.info("Please init pose by register first")
       raise RuntimeError
@@ -264,6 +264,8 @@ class FoundationPose:
     if ob_mask is not None and ob_mask.sum() > 500:
       center = self.guess_translation(depth=depth.data.cpu().numpy(), mask=ob_mask, K=K)
       ob_in_cams[:, :3, 3] = center
+    if alt_pose is not None:
+      ob_in_cams = alt_pose[None, :, :] 
     pose, vis = self.refiner.predict(mesh=self.mesh, mesh_tensors=self.mesh_tensors, rgb=rgb, depth=depth, K=K, ob_in_cams=ob_in_cams, normal_map=None, xyz_map=xyz_map, mesh_diameter=self.diameter, glctx=self.glctx, iteration=iteration, get_vis=self.debug>=2)
     logging.info("pose done")
     if self.debug>=2:
