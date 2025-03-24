@@ -259,7 +259,7 @@ def compute_pcds_dist(poses, object_mesh, object_pcds, to_origin, all_camera_ext
 def get_name(path):
     return os.path.basename(os.path.normpath(path))
 
-USE_TEXTURE = False
+USE_TEXTURE = True
 if __name__=='__main__':
   parser = argparse.ArgumentParser()
   code_dir = os.path.dirname(os.path.realpath(__file__))
