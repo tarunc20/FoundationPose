@@ -259,6 +259,27 @@ def compute_pcds_dist(poses, object_mesh, object_pcds, to_origin, all_camera_ext
 def get_name(path):
     return os.path.basename(os.path.normpath(path))
 
+def depth2xyzmap(depth, K, uvs=None):
+  invalid_mask = (depth<0.001)
+  H,W = depth.shape[:2]
+  if uvs is None:
+    vs,us = np.meshgrid(np.arange(0,H),np.arange(0,W), sparse=False, indexing='ij')
+    vs = vs.reshape(-1)
+    us = us.reshape(-1)
+  else:
+    uvs = uvs.round().astype(int)
+    us = uvs[:,0]
+    vs = uvs[:,1]
+  zs = depth[vs,us]
+  xs = (us-K[0,2])*zs/K[0,0]
+  ys = (vs-K[1,2])*zs/K[1,1]
+  pts = np.stack((xs.reshape(-1),ys.reshape(-1),zs.reshape(-1)), 1)  #(N,3)
+  xyz_map = np.zeros((H,W,3), dtype=np.float32)
+  xyz_map[vs,us] = pts
+  xyz_map[invalid_mask] = 0
+  return xyz_map
+
+
 USE_TEXTURE = True
 if __name__=='__main__':
   parser = argparse.ArgumentParser()
@@ -280,22 +301,25 @@ if __name__=='__main__':
   CAMERA_IDXS =  config['foundation_pose']['camera_idxs']
   print(f"trajectory: {get_name(args.data_dir)} {args.t} object: {args.mesh_file}")
   init_points = []
-  sam_pts = h5py.File(f"{args.data_dir}/sam2_pcds_{args.t}.h5", "r")
-  for i in range(len(sam_pts['cam_0'].keys())):
-      init_pts = [np.array(sam_pts[f'cam_{cam}'][f'pcd_{i}']) * 1e-3 for cam in range(8)]
-      init_points.append(init_pts)
+  # sam_pts = h5py.File(f"{args.data_dir}/sam2_pcds_{args.t}.h5", "r")
+  # for i in range(len(sam_pts['cam_0'].keys())):
+  #     init_pts = [np.array(sam_pts[f'cam_{cam}'][f'pcd_{i}']) * 1e-3 for cam in range(8)]
+  #     init_points.append(init_pts)
   other_mesh = trimesh.load(args.mesh_file, process=True)
   # load in texture information
   print(f"Register: {config['foundation_pose']['register']}")
   if USE_TEXTURE:
-    texture_file = args.mesh_file.replace('.obj', '.jpg')
-    texture = cv2.imread(texture_file)
-    from PIL import Image
-    im = Image.open(texture_file)
-    uv = other_mesh.visual.uv
-    material = trimesh.visual.texture.SimpleMaterial(image=im)
-    color_visuals = trimesh.visual.TextureVisuals(uv=uv, image=im, material=material)
-    other_mesh.visual = color_visuals
+    try:
+      texture_file = args.mesh_file.replace('decim_mesh_files', 'textures').replace('.obj', '.jpg')
+      texture = cv2.imread(texture_file)
+      from PIL import Image
+      im = Image.open(texture_file)
+      uv = other_mesh.visual.uv
+      material = trimesh.visual.texture.SimpleMaterial(image=im)
+      color_visuals = trimesh.visual.TextureVisuals(uv=uv, image=im, material=material)
+      other_mesh.visual = color_visuals
+    except:
+      print(f"Error loading texture file: {texture_file}")
   mesh=None 
   if len(other_mesh.vertices) > config['foundation_pose']['decim_verts_num']: # fix
     mesh = other_mesh.simplify_quadric_decimation(config['foundation_pose']['decim_verts_num']) #trimesh.Trimesh(vertices=samples, process=True)
@@ -340,7 +364,8 @@ if __name__=='__main__':
   imgs = {i: [] for i in CAMERA_IDXS}
   all_poses = {i: [] for i in CAMERA_IDXS}
   all_center_poses = {i: [] for i in CAMERA_IDXS}
-  sam_masks = h5py.File(f"{args.data_dir}/sam2_masks_{args.t}.h5", "r")
+  #sam_masks = h5py.File(f"{args.data_dir}/sam2_masks_{args.t}.h5", "r")
+  sam_masks = np.load(f"{args.data_dir}/masks.npy") * 255
   for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
     all_colors = {cam: None for cam in CAMERA_IDXS}
     all_depths = {cam: None for cam in CAMERA_IDXS}
@@ -354,7 +379,6 @@ if __name__=='__main__':
       depth[(depth<0.001) | (depth>=np.inf)] = 0
       all_colors[cam] = color
       all_depths[cam] = depth
-      #all_colors[cam] = np.where(np.asarray(sam_masks[f"masks_{cam}"][i])[:, :, None] > 0, 255, all_colors[cam])
 
     if i != START_FRAME and not register_now:
       # all previous poses should be same 
@@ -367,7 +391,7 @@ if __name__=='__main__':
           depth=all_depths[cam], 
           K=all_camera_intrinsics[cam], 
           iteration=config['foundation_pose']['track_refine_iter'], 
-          ob_mask=np.asarray(sam_masks[f"masks_{cam}"][i]), 
+          ob_mask=np.asarray(sam_masks[i, cam]), 
         )
         all_est_poses[cam] = pose.copy()
         if prev_poses[cam].shape == (1, 4, 4):
@@ -381,7 +405,7 @@ if __name__=='__main__':
       prev_poses = {cam: None for cam in CAMERA_IDXS}
       all_est_poses = {cam: None for cam in CAMERA_IDXS}
       for cam in CAMERA_IDXS:
-        mask = np.asarray(sam_masks[f"masks_{cam}"][i])
+        mask = np.asarray(sam_masks[i, cam])
         pose = None 
         if i == START_FRAME:
           pose = estimaters[cam].register(
@@ -414,10 +438,10 @@ if __name__=='__main__':
       #       estimaters[cam].pose_last = estimaters[cam].pose_last[0]
       # else:
       if config['foundation_pose']['use_pcd']:
-        opt_pose = optimize_poses_pcd(all_est_poses, mesh_copy, init_points[i], to_origin, all_camera_extrinsics, config['foundation_pose']['pcd_filter_thresh'])
+        pcds = {cam: depth2xyzmap(all_depths[cam], all_camera_intrinsics[cam])[sam_masks[i, cam] > 0] for cam in CAMERA_IDXS}
+        opt_pose = optimize_poses_pcd(all_est_poses, mesh_copy, pcds, to_origin, all_camera_extrinsics, config['foundation_pose']['pcd_filter_thresh'])
       else:
         opt_pose = optimize_poses(all_est_poses, all_camera_extrinsics, to_origin)
-      print(np.linalg.norm(opt_pose))
       if np.linalg.norm(opt_pose) < 1e-7:
         all_est_poses = {cam: (prev_poses[cam].copy() @ estimaters[cam].get_tf_to_centered_mesh().cpu().numpy()) for cam in CAMERA_IDXS}
         for cam in CAMERA_IDXS:
@@ -486,10 +510,16 @@ if __name__=='__main__':
   for cam in CAMERA_IDXS:
     # generate all frames 
     all_sam_frames = []
-    video = cv2.VideoCapture(f"{args.data_dir}/sam_{args.t}/test_{cam}_{args.t}.mp4")
-    for frame in range(500):
-      ret, frame = video.read()
-      all_sam_frames.append(frame)
+    for frame in range(config['foundation_pose']['num_frames']):
+      # Create a copy of the original image
+      img = np.asarray(data['imgs'][frame, cam, :, :, :]).copy()
+      
+      # Get the SAM mask for this frame and camera
+      sam_mask = sam_masks[frame, cam]
+      
+      # Set pixels to red where the SAM mask is nonzero
+      img[sam_mask > 0] = [0, 0, 255]  # RGB format: red
+      all_sam_frames.append(img)
     for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
       # outlier detected frame 
       sam_frame = all_sam_frames[i]

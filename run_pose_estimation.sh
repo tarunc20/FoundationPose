@@ -61,10 +61,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Check required arguments
-if [ -z "$DATA_DIR" ]  then
-    echo "Error: data_dir is required."
-    show_help
-fi
+# if [ -z "$DATA_DIR" ]  then
+#     echo "Error: data_dir is required."
+#     show_help
+# fi
 
 # Set up the environment
 cd /svl/u/tarunc/tool_use_benchmark/FoundationPose
