@@ -284,7 +284,7 @@ def toOpen3dCloud(points,colors=None,normals=None):
   if colors is not None:
     if colors.max()>1:
       colors = colors/255.0
-    cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+    cloud.colors = o3d.utility.Vector3dVector(np.asarray(colors.astype(np.float64)))
   if normals is not None:
     cloud.normals = o3d.utility.Vector3dVector(normals.astype(np.float64))
   return cloud
@@ -606,10 +606,10 @@ def compute_crop_window_tf_batch(pts=None, H=None, W=None, poses=None, K=None, c
                         radius,0,0,
                         -radius,0,0,
                         0,radius,0,
-                        0,-radius,0]).reshape(-1,3)
+                        0,-radius,0]).reshape(-1,3).float()
     pts = poses[:,:3,3].reshape(-1,1,3)+offsets.reshape(1,-1,3)
-    K = torch.as_tensor(K)
-    projected = (K@pts.reshape(-1,3).T).T
+    K = torch.as_tensor(K).float()
+    projected = (K@pts.float().reshape(-1,3).T).T
     uvs = projected[:,:2]/projected[:,2:3]
     uvs = uvs.reshape(B, -1, 2)
     center = uvs[:,0]  #(B,2)

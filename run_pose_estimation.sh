@@ -11,7 +11,7 @@
 
 # Default values
 CONFIG_FILE="fp_config.yaml"
-EXTRINSIC_FILE="/svl/u/tarunc/reconstructed_cameras_new.yaml"
+EXTRINSIC_FILE="/svl/u/tarunc/reconstructed_cameras_scaled.yaml"
 
 # Help message
 function show_help {
@@ -73,6 +73,7 @@ conda activate /svl/u/tarunc/pytorch3d_testing
 
 # Generate a unique ID for this run
 uuid=$(date +%s)
+#uuid="testing_cropped_cams"
 echo "Run UUID: $uuid"
 
 # Run tool pose estimation
@@ -99,7 +100,8 @@ if [ ! -z "$TARGET_MESH" ]; then
         --data_dir=$DATA_DIR \
         --uuid=$uuid \
         --extrinsic_file=$EXTRINSIC_FILE \
-        --t=target
+        --t=target \
+        --crop_masks 
 else
     echo "No target mesh provided, skipping target pose estimation."
 fi

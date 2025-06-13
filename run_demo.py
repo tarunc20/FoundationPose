@@ -191,18 +191,28 @@ def construct_dataset(center_poses, yaml_file_path, args):
     pickle.dump(dataset, open(f"{args.test_scene_dir}/dataset_obj_{args.test_scene_dir.split('/')[-1]}.pkl", "wb"))
 
 
-def optimize_poses(poses, cam_extrinsics, to_origin):
+def optimize_poses(poses, cam_extrinsics, to_origin, mesh_copy):
   """
   poses: list of poses predicted by each FoundationPose estimator
   cam_extrinsics: list of camera extrinsics for each pose
   """
-  world_poses = {cam: cam_extrinsics[cam] @ (poses[cam]) for cam in cam_extrinsics.keys()} # removed to_origin 
+  world_poses = {cam: cam_extrinsics[cam] @ poses[cam] for cam in cam_extrinsics.keys()} # removed to_origin 
   best_error = np.inf 
   best_estim = np.zeros((4, 4))
+  all_pose_meshes = {cam: None for cam in cam_extrinsics.keys()}
+  for cam in cam_extrinsics.keys():
+    all_pose_meshes[cam] = mesh_copy.copy()
+    all_pose_meshes[cam].apply_transform(world_poses[cam])
   for i in cam_extrinsics.keys():
-    inlier_idxs = [j for j in cam_extrinsics.keys() if matrix_distance(world_poses[i], world_poses[j])[0] < 0.25 and j != i]
+    inlier_idxs = []
+    for j in cam_extrinsics.keys():
+      chamfer_dists = ChamferDistance()(torch.tensor(all_pose_meshes[i].vertices[::20]).unsqueeze(0), torch.tensor(all_pose_meshes[j].vertices[::20]).unsqueeze(0)).item() / len(all_pose_meshes[i].vertices)
+      if chamfer_dists < 0.01:
+        inlier_idxs.append(j)
+    #inlier_idxs = [j for j in cam_extrinsics.keys() if matrix_distance(world_poses[i], world_poses[j])[0] < 0.25 and j != i]
     if len(inlier_idxs) == 0:
       continue
+    print(f"inlier_idxs: {inlier_idxs}")
     inlier_idxs += [i]
     mean_mat = np.mean([world_poses[idx][:3, :3] for idx in inlier_idxs], axis=0)
     mean_pos = np.mean([world_poses[idx][:3, 3] for idx in inlier_idxs], axis=0)
@@ -244,7 +254,7 @@ def optimize_poses_pcd(poses, object_mesh, object_pcds, to_origin, all_camera_ex
     good_idxs = [min(dists, key=dists.get), min(dists, key=dists.get)]
     return all_camera_extrinsics[good_idxs[0]] @ poses[good_idxs[0]]
   else:
-    return optimize_poses({cam: poses[cam] for cam in good_idxs}, {cam: all_camera_extrinsics[cam] for cam in good_idxs}, to_origin)
+    return optimize_poses({cam: poses[cam] for cam in good_idxs}, {cam: all_camera_extrinsics[cam] for cam in good_idxs}, to_origin, object_mesh.copy())
 
 def compute_pcds_dist(poses, object_mesh, object_pcds, to_origin, all_camera_extrinsics):
   object_mesh.apply_transform(np.linalg.inv(to_origin))
@@ -279,7 +289,53 @@ def depth2xyzmap(depth, K, uvs=None):
   xyz_map[invalid_mask] = 0
   return xyz_map
 
+def crop_mask_and_adjust_intrinsics(mask, K):
+    """
+    Given a binary mask (shape [480, 640]) and a camera intrinsic matrix K (3x3),
+    returns the bounding box (ymin, ymax, xmin, xmax) for a 200x200 region (with 20px padding)
+    centered on the mask==1 region, and a new intrinsic matrix K_new that incorporates the cropping.
+    Handles edge cases where the crop would go out of bounds.
+    """
+    H, W = mask.shape
+    ys, xs = np.where(mask == 255)
+    if len(xs) == 0 or len(ys) == 0:
+        # No foreground, return full image and original K
+        return (0, H, 0, W), K.copy()
+    # Center of the mask region
+    y_center = int(np.round(ys.mean()))
+    x_center = int(np.round(xs.mean()))
+    crop_size = 200
+    pad = 20
 
+    # Compute crop bounds
+    ymin = y_center - crop_size // 2 - pad
+    ymax = y_center + crop_size // 2 + pad
+    xmin = x_center - crop_size // 2 - pad
+    xmax = x_center + crop_size // 2 + pad
+
+    # Adjust crop to take the appropriate corner if at the borders
+    if ymin < 0:
+        ymax = min(H, ymax - ymin)
+        ymin = 0
+    if xmin < 0:
+        xmax = min(W, xmax - xmin)
+        xmin = 0
+    if ymax > H:
+        ymin = max(0, ymin - (ymax - H))
+        ymax = H
+    if xmax > W:
+        xmin = max(0, xmin - (xmax - W))
+        xmax = W
+
+    # If crop is smaller than 200+2*pad due to image edge, adjust to get as close as possible
+    # (optional: could shift crop to keep size, but here we just clamp)
+    K_new = K.copy().astype(np.float32)
+    K_new[0, 2] -= xmin
+    K_new[1, 2] -= ymin
+    return (ymin, ymax, xmin, xmax), K_new
+
+CAMERA_WIDTH = 240
+CAMERA_HEIGHT = 240
 USE_TEXTURE = True
 if __name__=='__main__':
   parser = argparse.ArgumentParser()
@@ -291,6 +347,8 @@ if __name__=='__main__':
   parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug')
   parser.add_argument('--t', type=str)
   parser.add_argument('--extrinsic_file', type=str, default='')
+  parser.add_argument('--est_depths', action='store_true')
+  parser.add_argument('--crop_masks', action='store_true')
   args = parser.parse_args()
   set_logging_format()
   set_seed(0)
@@ -344,7 +402,11 @@ if __name__=='__main__':
     est = FoundationPose(model_pts=mesh.vertices, model_normals=mesh.vertex_normals, mesh=mesh, scorer=scorer, refiner=refiner, debug_dir=debug_dir, debug=debug, glctx=glctx)
     estimaters[cam] = est
   logging.info("estimator initialization done")
-  data = h5py.File(f"{args.data_dir}/data00000000.h5", "r")
+  if 'annotated' in args.data_dir:
+    load_dir = ''.join(args.data_dir.split('_annotated'))
+  else:
+    load_dir = args.data_dir
+  data = h5py.File(f"{load_dir}/data00000000.h5", "r")
   yaml_file = open(args.extrinsic_file)
   yaml_data = yaml.safe_load(yaml_file)
   #serials = [yaml_data[i]['serial_number'] for i in range(len(yaml_data))]
@@ -360,39 +422,66 @@ if __name__=='__main__':
     for i in CAMERA_IDXS
   }
   registration_idxs = []
-
+  if args.est_depths:
+    est_depths = np.load(f"/svl/u/tarunc/tool_use_benchmark/FoundationStereo/all_est_depths_{args.data_dir.split('/')[-1]}_denoised.npy")
   imgs = {i: [] for i in CAMERA_IDXS}
   all_poses = {i: [] for i in CAMERA_IDXS}
   all_center_poses = {i: [] for i in CAMERA_IDXS}
-  #sam_masks = h5py.File(f"{args.data_dir}/sam2_masks_{args.t}.h5", "r")
-  sam_masks = np.load(f"{args.data_dir}/masks.npy") * 255
+  if args.t == "tool":
+    sam_masks = np.load(f"{args.data_dir}/masks_auxiliary.npy") 
+    sam_masks[sam_masks == 510] = 0
+  else:
+    sam_masks = np.load(f"{args.data_dir}/masks_auxiliary.npy")
+    sam_masks[sam_masks == 255] = 0
+    sam_masks[sam_masks == 510] = 255
+  if NUM_FRAMES == "none":
+    NUM_FRAMES = len(sam_masks)
   for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
     all_colors = {cam: None for cam in CAMERA_IDXS}
     all_depths = {cam: None for cam in CAMERA_IDXS}
     register_now = config['foundation_pose']['register']
     for cam in CAMERA_IDXS:
       color = data['imgs'][i, cam, :, :, :].astype(np.uint8)[...,:3]
-      color = cv2.resize(color, (640, 480), interpolation=cv2.INTER_NEAREST)
+      #color = cv2.resize(color, (CAMERA_WIDTH, CAMERA_HEIGHT), interpolation=cv2.INTER_NEAREST)
       depth = data['depths'][i, cam, :, :].astype(np.float64)
       depth /= 1e3
-      depth = cv2.resize(depth, (640,480), interpolation=cv2.INTER_NEAREST)
+      #depth = cv2.resize(depth, (CAMERA_WIDTH, CAMERA_HEIGHT), interpolation=cv2.INTER_NEAREST)
       depth[(depth<0.001) | (depth>=np.inf)] = 0
       all_colors[cam] = color
       all_depths[cam] = depth
-
+      if args.est_depths:
+        all_depths[cam] = est_depths[i] / 1.15
+      # all_colors[cam][sam_masks[i, cam] == 0] = 0
+    if args.crop_masks:
+      coords, cropped_intrinsics = crop_mask_and_adjust_intrinsics(sam_masks[i, CAMERA_IDXS[0]], all_camera_intrinsics[CAMERA_IDXS[0]])
+      cropped_rgb = all_colors[CAMERA_IDXS[0]][coords[0]:coords[1], coords[2]:coords[3]]
+      cropped_depth = all_depths[CAMERA_IDXS[0]][coords[0]:coords[1], coords[2]:coords[3]]
+      cropped_mask = sam_masks[i, CAMERA_IDXS[0]][coords[0]:coords[1], coords[2]:coords[3]]
+    else:
+      cropped_rgb = all_colors[CAMERA_IDXS[0]]
+      cropped_depth = all_depths[CAMERA_IDXS[0]]
+      cropped_mask = sam_masks[i, CAMERA_IDXS[0]]
     if i != START_FRAME and not register_now:
       # all previous poses should be same 
       prev_poses = {cam: estimaters[cam].pose_last.cpu().detach().numpy() for cam in CAMERA_IDXS}
       all_est_poses = {cam: None for cam in CAMERA_IDXS}
       prev_dists = []
       for cam in CAMERA_IDXS:
-        pose = estimaters[cam].track_one(
-          rgb=all_colors[cam], 
-          depth=all_depths[cam], 
-          K=all_camera_intrinsics[cam], 
-          iteration=config['foundation_pose']['track_refine_iter'], 
-          ob_mask=np.asarray(sam_masks[i, cam]), 
-        )
+        if args.crop_masks:
+          pose = estimaters[cam].track_one(
+            rgb=cropped_rgb, 
+            depth=cropped_depth, 
+            K=cropped_intrinsics, 
+            iteration=config['foundation_pose']['track_refine_iter'], 
+            ob_mask=cropped_mask, 
+          )
+        else:
+          pose = estimaters[cam].track_one(
+            rgb=all_colors[cam], 
+            depth=all_depths[cam], 
+            K=all_camera_intrinsics[cam], 
+            iteration=config['foundation_pose']['track_refine_iter'], 
+          )
         all_est_poses[cam] = pose.copy()
         if prev_poses[cam].shape == (1, 4, 4):
           prev_poses[cam] = prev_poses[cam][0]
@@ -408,24 +497,56 @@ if __name__=='__main__':
         mask = np.asarray(sam_masks[i, cam])
         pose = None 
         if i == START_FRAME:
-          pose = estimaters[cam].register(
-            K=all_camera_intrinsics[cam], 
-            rgb=all_colors[cam], 
-            depth=all_depths[cam], 
-            ob_mask=mask, 
-            iteration=config['foundation_pose']['est_refine_iter'])
+          if args.crop_masks:
+            pose = estimaters[cam].register(
+              K=cropped_intrinsics, 
+              rgb=cropped_rgb, 
+              depth=cropped_depth, 
+              ob_mask=cropped_mask, 
+              iteration=config['foundation_pose']['est_refine_iter'])
+          else:
+            pose = estimaters[cam].register(
+              K=all_camera_intrinsics[cam], 
+              rgb=all_colors[cam], 
+              depth=all_depths[cam], 
+              ob_mask=mask, 
+              iteration=config['foundation_pose']['est_refine_iter'])
           prev_poses[cam] = pose.copy()
         else:
           prev_poses[cam] = estimaters[cam].pose_last.cpu().detach().numpy()
-          pose = estimaters[cam].register(
-            K=all_camera_intrinsics[cam], 
-            rgb=all_colors[cam], 
-            depth=all_depths[cam], 
-            ob_mask=mask, 
-            iteration=config['foundation_pose']['est_refine_iter'])
+          if args.crop_masks:
+            pose = estimaters[cam].register(
+              K=cropped_intrinsics, 
+              rgb=cropped_rgb, 
+              depth=cropped_depth, 
+              ob_mask=cropped_mask, 
+              iteration=config['foundation_pose']['est_refine_iter'])
+          else:
+            pose = estimaters[cam].register(
+              K=all_camera_intrinsics[cam], 
+              rgb=all_colors[cam], 
+              depth=all_depths[cam], 
+              ob_mask=mask, 
+              iteration=config['foundation_pose']['est_refine_iter'])
         all_est_poses[cam] = pose
         if prev_poses[cam].shape == (1, 4, 4):
           prev_poses[cam] = prev_poses[cam][0]
+        
+        # save pcd first frame camera 0 for debugging
+        if debug >= 3:
+          m = mesh.copy()
+          pcd = trimesh.PointCloud(m.vertices)
+          os.makedirs(f"{debug_dir}/pcds", exist_ok=True)
+          m.export(f'{debug_dir}/model_tf.obj')
+          if args.crop_masks:
+            xyz_map = depth2xyzmap(cropped_depth, cropped_intrinsics)
+            valid_mask = cropped_mask > 0
+            pcd = toOpen3dCloud(xyz_map[valid_mask], cropped_rgb[valid_mask])
+          else:
+            xyz_map = depth2xyzmap(all_depths[cam], all_camera_intrinsics[cam])
+            valid_mask = all_depths[cam] > 0.001
+            pcd = toOpen3dCloud(xyz_map[valid_mask], all_colors[cam][valid_mask])
+          #o3d.io.write_point_cloud(f'{debug_dir}/scene_complete.ply', pcd)
     # compute all pairwise distances
     if config['foundation_pose']['use_ransac']:
       all_dists = [matrix_distance(all_est_poses[CAMERA_IDXS[cam1]], all_est_poses[CAMERA_IDXS[cam2]])[0]
@@ -439,9 +560,17 @@ if __name__=='__main__':
       # else:
       if config['foundation_pose']['use_pcd']:
         pcds = {cam: depth2xyzmap(all_depths[cam], all_camera_intrinsics[cam])[sam_masks[i, cam] > 0] for cam in CAMERA_IDXS}
+        # trimesh_pcds = [trimesh.PointCloud(pcd) for pcd in pcds.values()]
+        # for cam, pcd in enumerate(trimesh_pcds):
+        #   measurement_mesh = mesh.copy()
+        #   measurement_mesh.apply_transform(all_camera_extrinsics[cam] @ all_est_poses[cam])
+        #   pcd.apply_transform(all_camera_extrinsics[cam])
+        #   dists = np.linalg.norm(measurement_mesh.vertices.mean(axis=0) - pcd.vertices.mean(axis=0))
+        #   print(f"cam: {cam}, dists: {dists}")
         opt_pose = optimize_poses_pcd(all_est_poses, mesh_copy, pcds, to_origin, all_camera_extrinsics, config['foundation_pose']['pcd_filter_thresh'])
       else:
         opt_pose = optimize_poses(all_est_poses, all_camera_extrinsics, to_origin)
+      #assert np.linalg.norm(opt_pose) > 1e-7, f"opt_pose: {opt_pose}"
       if np.linalg.norm(opt_pose) < 1e-7:
         all_est_poses = {cam: (prev_poses[cam].copy() @ estimaters[cam].get_tf_to_centered_mesh().cpu().numpy()) for cam in CAMERA_IDXS}
         for cam in CAMERA_IDXS:
@@ -462,113 +591,174 @@ if __name__=='__main__':
           all_est_poses[cam] = all_est_poses[cam][0]
         center_pose = all_est_poses[cam] @ np.linalg.inv(to_origin)
         assert center_pose.shape == (4, 4), f"center pose shape: {center_pose.shape, all_est_poses[cam].shape}"
-        vis = draw_posed_3d_box(all_camera_intrinsics[cam], img=all_colors[cam], ob_in_cam=center_pose, bbox=bbox)
-        vis = draw_xyz_axis(all_colors[cam], ob_in_cam=center_pose, scale=0.1, K=all_camera_intrinsics[cam], thickness=3, transparency=0, is_input_rgb=True)
+        if args.crop_masks:
+          vis = draw_posed_3d_box(cropped_intrinsics, img=cropped_rgb, ob_in_cam=center_pose, bbox=bbox)
+          vis = draw_xyz_axis(cropped_rgb, ob_in_cam=center_pose, scale=0.1, K=cropped_intrinsics, thickness=3, transparency=0, is_input_rgb=True)
+        else:
+          vis = draw_posed_3d_box(all_camera_intrinsics[cam], img=all_colors[cam], ob_in_cam=center_pose, bbox=bbox)
+          vis = draw_xyz_axis(all_colors[cam], ob_in_cam=center_pose, scale=0.1, K=all_camera_intrinsics[cam], thickness=3, transparency=0, is_input_rgb=True)
         mesh.apply_transform(np.linalg.inv(all_est_poses[cam]))
-
       if debug>=3:
         os.makedirs(f'{debug_dir}/track_vis', exist_ok=True)
         imageio.imwrite(f'{debug_dir}/track_vis/img_{i}.png', vis[:, :, ::-1])
       imgs[cam].append(vis)
       all_poses[cam].append(pose)
       all_center_poses[cam].append(center_pose)
-  all_pre_optim_poses = [
-    all_camera_extrinsics[CAMERA_IDXS[0]] @ all_center_poses[CAMERA_IDXS[0]][step]
-    for step in range(len(all_center_poses[CAMERA_IDXS[0]]))
-  ]
+  for outlier_threshold in [np.inf]: #[0.9]:
+    all_pre_optim_poses = [
+      all_camera_extrinsics[CAMERA_IDXS[0]] @ all_center_poses[CAMERA_IDXS[0]][step]
+      for step in range(len(all_center_poses[CAMERA_IDXS[0]]))
+    ]
 
-  object_trimesh = trimesh.load(args.mesh_file)
-  object_trimesh.vertices *= 0.001
-  to_origin, extents = trimesh.bounds.oriented_bounds(object_trimesh)
-  object_trimesh.apply_transform(to_origin)
-  orig_vertices = object_trimesh.vertices.copy()
+    object_trimesh = trimesh.load(args.mesh_file)
+    object_trimesh.vertices *= 0.001
+    to_origin, extents = trimesh.bounds.oriented_bounds(object_trimesh)
+    object_trimesh.apply_transform(to_origin)
+    orig_vertices = object_trimesh.vertices.copy()
 
-  # 4x4 image - top left is foundationpose view top right is sam bottom left is 
-  # outlier detected bottom right is outlier optimized
-  all_frames = []
-  outlier_idxs = []
-  all_post_optim_poses = []
-  for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
-    if i > START_FRAME and i - 1 in outlier_idxs:
-        if matrix_distance(all_pre_optim_poses[i-START_FRAME], all_pre_optim_poses[i-1-START_FRAME])[1] < 0.5:
-            outlier_idxs.append(i)
-    elif i > START_FRAME and matrix_distance(all_pre_optim_poses[i-START_FRAME], all_pre_optim_poses[i-1-START_FRAME])[1] > 5: # 0.9:
-        outlier_idxs.append(i)
-  # perform linear interpolation between poses
-  for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
-    if i in outlier_idxs:
-      less, greater = i - 1, i + 1 
-      while less in outlier_idxs:
-          less -= 1
-      while greater in outlier_idxs:
-          greater += 1
-      frac = (i - less) / (greater - less)
-      correct_rotation = slerp_4x4(all_pre_optim_poses[less-START_FRAME], all_pre_optim_poses[greater-START_FRAME], frac)
-      all_post_optim_poses.append(correct_rotation)
-    else:
-      all_post_optim_poses.append(all_pre_optim_poses[i-START_FRAME])
-  for cam in CAMERA_IDXS:
-    # generate all frames 
-    all_sam_frames = []
-    for frame in range(config['foundation_pose']['num_frames']):
-      # Create a copy of the original image
-      img = np.asarray(data['imgs'][frame, cam, :, :, :]).copy()
-      
-      # Get the SAM mask for this frame and camera
-      sam_mask = sam_masks[frame, cam]
-      
-      # Set pixels to red where the SAM mask is nonzero
-      img[sam_mask > 0] = [0, 0, 255]  # RGB format: red
-      all_sam_frames.append(img)
+    # 4x4 image - top left is foundationpose view top right is sam bottom left is 
+    # outlier detected bottom right is outlier optimized
+    all_frames = []
+    outlier_idxs = []
+    all_post_optim_poses = []
     for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
-      # outlier detected frame 
-      sam_frame = all_sam_frames[i]
-      # outlier frame 
-      outlier_frame = np.asarray(data['imgs'][i, cam, :, :, :]).copy()
-      object_trimesh.vertices = orig_vertices.copy()
-      object_trimesh.apply_transform(all_pre_optim_poses[i-START_FRAME])
-      object_points_2d = project_points_to_image(all_camera_intrinsics[cam], all_camera_extrinsics[cam], object_trimesh.vertices)
-      points_2d = object_points_2d[::200, :]
-      points_2d = points_2d[points_2d[:, 0] >= 0]
-      points_2d = points_2d[points_2d[:, 1] >= 0]
-      points_2d = points_2d[points_2d[:, 1] < 480]
-      points_2d = points_2d[points_2d[:, 0] < 640]
-      points_2d = points_2d.astype(np.uint64)
-      color = None 
+      if i > START_FRAME and i - 1 in outlier_idxs:
+          if matrix_distance(all_pre_optim_poses[i-START_FRAME], all_pre_optim_poses[i-1-START_FRAME])[1] < 0.5:
+              outlier_idxs.append(i)
+      elif i > START_FRAME and matrix_distance(all_pre_optim_poses[i-START_FRAME], all_pre_optim_poses[i-1-START_FRAME])[1] > outlier_threshold:
+          outlier_idxs.append(i)
+    # perform linear interpolation between poses
+    for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
       if i in outlier_idxs:
-          color = np.array([[0, 0, 255]])
+        less, greater = i - 1, i + 1 
+        while less in outlier_idxs:
+            less -= 1
+        while greater in outlier_idxs:
+            greater += 1
+        frac = (i - less) / (greater - less)
+        correct_rotation = slerp_4x4(all_pre_optim_poses[max(less-START_FRAME, 0)], all_pre_optim_poses[min(greater-START_FRAME, len(all_pre_optim_poses) - 1)], frac)
+        all_post_optim_poses.append(correct_rotation)
       else:
-          color = np.array([[255, 0, 0]])
-      outlier_frame[points_2d[:, 1], points_2d[:, 0]] = color
-      # corrected outlier frame
-      corr_outlier_frame = np.asarray(data['imgs'][i, cam, :, :, :]).copy()
-      object_trimesh.vertices = orig_vertices.copy()
-      object_trimesh.apply_transform(all_post_optim_poses[i-START_FRAME])
-      object_points_2d = project_points_to_image(all_camera_intrinsics[cam], all_camera_extrinsics[cam], object_trimesh.vertices)
-      points_2d = object_points_2d[::200, :]
-      points_2d = points_2d[points_2d[:, 0] >= 0]
-      points_2d = points_2d[points_2d[:, 1] >= 0]
-      points_2d = points_2d[points_2d[:, 1] < 480]
-      points_2d = points_2d[points_2d[:, 0] < 640]
-      points_2d = points_2d.astype(np.uint64)
-      color = None 
-      if i in outlier_idxs:
-          color = np.array([[0, 0, 255]])
-      else:
-          color = np.array([[255, 0, 0]])
-      corr_outlier_frame[points_2d[:, 1], points_2d[:, 0]] = color
-      frame = np.concatenate(
-        (np.concatenate((imgs[cam][i - START_FRAME], sam_frame), axis=1),
-         np.concatenate((outlier_frame, corr_outlier_frame), axis=1)),
-         axis=0
-      )
-      all_frames.append(frame)
-  os.makedirs(f"{args.data_dir}/fp_{args.t}/results_{RUN_UUID}", exist_ok=True)
-  fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-  out = cv2.VideoWriter(f"{args.data_dir}/fp_{args.t}/results_{RUN_UUID}/traj_vid.mp4", fourcc, 30, (vis.shape[1] * 2, vis.shape[0] * 2))
-  for img in all_frames:
-    out.write(img)
-  out.release()
+        all_post_optim_poses.append(all_pre_optim_poses[i-START_FRAME])
+    for cam in CAMERA_IDXS:
+      # generate all frames 
+      all_sam_frames = []
+      for frame in range(NUM_FRAMES):#config['foundation_pose']['num_frames']):
+        # Create a copy of the original image
+        img = np.asarray(data['imgs'][frame, cam, :, :, :]).copy()
+        
+        # Get the SAM mask for this frame and camera
+        sam_mask = sam_masks[frame, cam]
+        
+        # Set pixels to red where the SAM mask is nonzero
+        img[sam_mask > 0] = [0, 0, 255]  # RGB format: red
+        all_sam_frames.append(img)
+      for i in tqdm(range(START_FRAME, START_FRAME + NUM_FRAMES)):
+        # outlier detected frame 
+        if args.crop_masks:
+            # Apply cropping as in previous part of the code
+            coords, cropped_intrinsics = crop_mask_and_adjust_intrinsics(
+                sam_masks[i, CAMERA_IDXS[0]], all_camera_intrinsics[CAMERA_IDXS[0]]
+            )
+
+            # Crop the images for this frame and camera
+            sam_frame = all_sam_frames[i][coords[0]:coords[1], coords[2]:coords[3]]
+            outlier_frame = np.asarray(data['imgs'][i, cam, :, :, :]).copy()
+            outlier_frame = outlier_frame[coords[0]:coords[1], coords[2]:coords[3]]
+            corr_outlier_frame = np.asarray(data['imgs'][i, cam, :, :, :]).copy()
+            corr_outlier_frame = corr_outlier_frame[coords[0]:coords[1], coords[2]:coords[3]]
+
+            # Project points using cropped intrinsics
+            object_trimesh.vertices = orig_vertices.copy()
+            object_trimesh.apply_transform(all_pre_optim_poses[i-START_FRAME])
+            object_points_2d = project_points_to_image(
+                cropped_intrinsics, all_camera_extrinsics[cam], object_trimesh.vertices
+            )
+            # Adjust points to cropped coordinates
+            points_2d = object_points_2d[::200, :]
+            points_2d = points_2d[points_2d[:, 0] >= 0]
+            points_2d = points_2d[points_2d[:, 1] >= 0]
+            points_2d = points_2d[points_2d[:, 1] < (coords[1] - coords[0])]
+            points_2d = points_2d[points_2d[:, 0] < (coords[3] - coords[2])]
+            points_2d = points_2d.astype(np.uint64)
+            color = np.array([[0, 0, 255]]) if i in outlier_idxs else np.array([[255, 0, 0]])
+            outlier_frame[points_2d[:, 1], points_2d[:, 0]] = color
+
+            # Corrected outlier frame
+            object_trimesh.vertices = orig_vertices.copy()
+            object_trimesh.apply_transform(all_post_optim_poses[i-START_FRAME])
+            object_points_2d = project_points_to_image(
+                cropped_intrinsics, all_camera_extrinsics[cam], object_trimesh.vertices
+            )
+            points_2d = object_points_2d[::200, :]
+            points_2d = points_2d[points_2d[:, 0] >= 0]
+            points_2d = points_2d[points_2d[:, 1] >= 0]
+            points_2d = points_2d[points_2d[:, 1] < (coords[1] - coords[0])]
+            points_2d = points_2d[points_2d[:, 0] < (coords[3] - coords[2])]
+            points_2d = points_2d.astype(np.uint64)
+            color = np.array([[0, 0, 255]]) if i in outlier_idxs else np.array([[255, 0, 0]])
+            corr_outlier_frame[points_2d[:, 1], points_2d[:, 0]] = color
+
+            # Also crop the original image for the top-left cell
+            orig_img = imgs[cam][i - START_FRAME]# [coords[0]:coords[1], coords[2]:coords[3]]
+
+            frame = np.concatenate(
+                (
+                    np.concatenate((orig_img, sam_frame), axis=1),
+                    np.concatenate((outlier_frame, corr_outlier_frame), axis=1),
+                ),
+                axis=0,
+            )
+            all_frames.append(frame)
+        else:
+            sam_frame = all_sam_frames[i]
+            # outlier frame 
+            outlier_frame = np.asarray(data['imgs'][i, cam, :, :, :]).copy()
+            object_trimesh.vertices = orig_vertices.copy()
+            object_trimesh.apply_transform(all_pre_optim_poses[i-START_FRAME])
+            object_points_2d = project_points_to_image(all_camera_intrinsics[cam], all_camera_extrinsics[cam], object_trimesh.vertices)
+            points_2d = object_points_2d[::200, :]
+            points_2d = points_2d[points_2d[:, 0] >= 0]
+            points_2d = points_2d[points_2d[:, 1] >= 0]
+            points_2d = points_2d[points_2d[:, 1] < 480]
+            points_2d = points_2d[points_2d[:, 0] < 640]
+            points_2d = points_2d.astype(np.uint64)
+            color = None 
+            if i in outlier_idxs:
+                color = np.array([[0, 0, 255]])
+            else:
+                color = np.array([[255, 0, 0]])
+            outlier_frame[points_2d[:, 1], points_2d[:, 0]] = color
+            # corrected outlier frame
+            corr_outlier_frame = np.asarray(data['imgs'][i, cam, :, :, :]).copy()
+            object_trimesh.vertices = orig_vertices.copy()
+            object_trimesh.apply_transform(all_post_optim_poses[i-START_FRAME])
+            object_points_2d = project_points_to_image(all_camera_intrinsics[cam], all_camera_extrinsics[cam], object_trimesh.vertices)
+            points_2d = object_points_2d[::200, :]
+            points_2d = points_2d[points_2d[:, 0] >= 0]
+            points_2d = points_2d[points_2d[:, 1] >= 0]
+            points_2d = points_2d[points_2d[:, 1] < 480]
+            points_2d = points_2d[points_2d[:, 0] < 640]
+            points_2d = points_2d.astype(np.uint64)
+            color = None 
+            if i in outlier_idxs:
+                color = np.array([[0, 0, 255]])
+            else:
+                color = np.array([[255, 0, 0]])
+            corr_outlier_frame[points_2d[:, 1], points_2d[:, 0]] = color
+            frame = np.concatenate(
+              (np.concatenate((imgs[cam][i - START_FRAME], sam_frame), axis=1),
+              np.concatenate((outlier_frame, corr_outlier_frame), axis=1)),
+              axis=0
+            )
+            all_frames.append(frame)
+    os.makedirs(f"{args.data_dir}/fp_{args.t}/results_{RUN_UUID}", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(f"{args.data_dir}/fp_{args.t}/results_{RUN_UUID}/traj_vid.mp4", fourcc, 30, (vis.shape[1] * 2, vis.shape[0] * 2))
+    #out = cv2.VideoWriter(f"test.mp4", fourcc, 30, (vis.shape[1] * 2, vis.shape[0] * 2))
+    for img in all_frames:
+      out.write(img)
+    out.release()
   np.save(f"{args.data_dir}/fp_{args.t}/results_{RUN_UUID}/all_fp_poses.npy", np.array(all_pre_optim_poses))
   np.save(f"{args.data_dir}/fp_{args.t}/results_{RUN_UUID}/all_outlier_poses.npy", np.array(all_post_optim_poses))
   config_file = {
@@ -581,8 +771,8 @@ if __name__=='__main__':
     'camera_idxs': config['foundation_pose']['camera_idxs'],
     'decim_verts_num': config['foundation_pose']['decim_verts_num'],
     'pcd_filter_thresh': config['foundation_pose']['pcd_filter_thresh'],
-    'start_frame': config['foundation_pose']['start_frame'],
-    'num_frames': config['foundation_pose']['num_frames'],
+    'start_frame': START_FRAME,
+    'num_frames': NUM_FRAMES,
     'extrinsic_file': args.extrinsic_file,
     'register': config['foundation_pose']['register'],
   }
